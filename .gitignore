@@ -1,0 +1,21 @@
+# Build output
+target/
+
+# IDE files
+.idea/
+*.iml
+.vscode/
+.settings/
+.project
+.classpath
+.factorypath
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Maven
+dependency-reduced-pom.xml
+
+# Node (prettier plugin)
+node_modules/

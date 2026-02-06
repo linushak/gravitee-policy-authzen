@@ -1,0 +1,209 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "pdpEndpoint": {
+      "title": "PDP Endpoint URL",
+      "description": "Full URL of the AuthZEN Policy Decision Point access evaluation endpoint (e.g., https://pdp.example.com/access/v1/evaluation)",
+      "type": "string",
+      "pattern": "^https?://.+",
+      "gioConfig": {
+        "banner": {
+          "title": "AuthZEN PDP Configuration",
+          "text": "Configure the connection to your AuthZEN-compliant Policy Decision Point (PDP). All value fields support Gravitee Expression Language (EL)."
+        }
+      }
+    },
+    "authorizationHeaderValue": {
+      "title": "Authorization Header",
+      "description": "Value for the Authorization header sent to the PDP. Supports EL (e.g., 'Bearer {#context.attributes[\"pdp_token\"]}')",
+      "type": "string"
+    },
+    "subjectType": {
+      "title": "Subject Type",
+      "description": "AuthZEN subject type. Supports EL. Common values: 'user', 'identity', 'service'",
+      "type": "string",
+      "default": "user"
+    },
+    "subjectId": {
+      "title": "Subject ID",
+      "description": "Unique identifier of the subject. Supports EL (e.g., '{#context.attributes[\"user\"]}')",
+      "type": "string"
+    },
+    "subjectProperties": {
+      "title": "Subject Properties",
+      "description": "Additional properties to include in the AuthZEN subject object",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "title": "Property",
+        "properties": {
+          "name": {
+            "title": "Name",
+            "description": "Property name",
+            "type": "string",
+            "minLength": 1
+          },
+          "value": {
+            "title": "Value (supports EL)",
+            "description": "Property value. Supports Gravitee Expression Language",
+            "type": "string"
+          }
+        },
+        "required": ["name", "value"]
+      }
+    },
+    "resourceType": {
+      "title": "Resource Type",
+      "description": "AuthZEN resource type. Supports EL. When MCP request parsing is enabled and this field is empty, it is auto-mapped to 'mcp-tool', 'mcp-resource', or 'mcp-prompt' based on the MCP method.",
+      "type": "string"
+    },
+    "resourceId": {
+      "title": "Resource ID",
+      "description": "Unique identifier of the resource. Supports EL. When MCP request parsing is enabled and this field is empty, it is auto-mapped to the tool name, resource URI, or prompt name from the MCP request.",
+      "type": "string"
+    },
+    "resourceProperties": {
+      "title": "Resource Properties",
+      "description": "Additional properties to include in the AuthZEN resource object",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "title": "Property",
+        "properties": {
+          "name": {
+            "title": "Name",
+            "description": "Property name",
+            "type": "string",
+            "minLength": 1
+          },
+          "value": {
+            "title": "Value (supports EL)",
+            "description": "Property value. Supports Gravitee Expression Language",
+            "type": "string"
+          }
+        },
+        "required": ["name", "value"]
+      }
+    },
+    "actionName": {
+      "title": "Action Name",
+      "description": "AuthZEN action name. Supports EL. When MCP request parsing is enabled and this field is empty, it is auto-mapped to the tool name for tools/call (e.g., 'getPetById'), or the MCP method for other operations (e.g., 'resources/read').",
+      "type": "string"
+    },
+    "actionProperties": {
+      "title": "Action Properties",
+      "description": "Additional properties to include in the AuthZEN action object",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "title": "Property",
+        "properties": {
+          "name": {
+            "title": "Name",
+            "description": "Property name",
+            "type": "string",
+            "minLength": 1
+          },
+          "value": {
+            "title": "Value (supports EL)",
+            "description": "Property value. Supports Gravitee Expression Language",
+            "type": "string"
+          }
+        },
+        "required": ["name", "value"]
+      }
+    },
+    "contextEntries": {
+      "title": "Context Entries",
+      "description": "Key-value pairs for the AuthZEN request context (environment attributes)",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "title": "Context Entry",
+        "properties": {
+          "name": {
+            "title": "Name",
+            "description": "Context key",
+            "type": "string",
+            "minLength": 1
+          },
+          "value": {
+            "title": "Value (supports EL)",
+            "description": "Context value. Supports Gravitee Expression Language",
+            "type": "string"
+          }
+        },
+        "required": ["name", "value"]
+      }
+    },
+    "mcpRequestParsing": {
+      "title": "Enable MCP Request Parsing",
+      "description": "When enabled, the policy parses the HTTP request body as a JSON-RPC (MCP) request and extracts MCP method, tool name, resource URI, and prompt name into execution context attributes. Enable this when deploying on an MCP Proxy API. These attributes can be used in EL expressions: {#context.attributes['authzen.mcp.method']}, {#context.attributes['authzen.mcp.item.name']}, etc.",
+      "type": "boolean",
+      "default": false,
+      "gioConfig": {
+        "banner": {
+          "title": "MCP Proxy Support",
+          "text": "Enable MCP request parsing to use this policy on MCP Proxy APIs. When enabled, the policy extracts MCP context (tool names, resource URIs, prompt names) from the JSON-RPC body and makes them available as execution attributes for use in EL expressions."
+        }
+      }
+    },
+    "denyOnError": {
+      "title": "Deny on Error (Fail Closed)",
+      "description": "If enabled, requests are denied when the PDP is unreachable or returns an error. If disabled, requests are allowed (fail open).",
+      "type": "boolean",
+      "default": true
+    },
+    "denyStatusCode": {
+      "title": "Deny HTTP Status Code",
+      "description": "HTTP status code returned when the AuthZEN PDP denies access",
+      "type": "integer",
+      "default": 403,
+      "minimum": 400,
+      "maximum": 599
+    },
+    "denyMessage": {
+      "title": "Deny Message",
+      "description": "Response message when access is denied",
+      "type": "string",
+      "default": "Access denied by authorization policy"
+    },
+    "errorStatusCode": {
+      "title": "Error HTTP Status Code",
+      "description": "HTTP status code returned when the PDP call fails",
+      "type": "integer",
+      "default": 500,
+      "minimum": 400,
+      "maximum": 599
+    },
+    "errorMessage": {
+      "title": "Error Message",
+      "description": "Response message when the PDP call fails",
+      "type": "string",
+      "default": "Authorization service unavailable"
+    },
+    "useSystemProxy": {
+      "title": "Use System Proxy",
+      "description": "Use the gateway's configured system proxy for PDP calls",
+      "type": "boolean",
+      "default": false
+    },
+    "connectTimeoutMs": {
+      "title": "Connect Timeout (ms)",
+      "description": "HTTP connection timeout in milliseconds for the PDP call",
+      "type": "integer",
+      "default": 5000,
+      "minimum": 100,
+      "maximum": 60000
+    },
+    "preserveResponseContext": {
+      "title": "Preserve Response Context",
+      "description": "Store the AuthZEN response context as a gateway execution attribute (authzen.response.context)",
+      "type": "boolean",
+      "default": true
+    }
+  },
+  "required": ["pdpEndpoint", "subjectId"]
+}
