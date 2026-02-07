@@ -6,15 +6,7 @@ A [Gravitee APIM](https://github.com/gravitee-io/gravitee-api-management) gatewa
 
 This policy acts as a **Policy Enforcement Point (PEP)** within the Gravitee API Gateway. During the **request phase**, it calls an external AuthZEN-compliant **Policy Decision Point (PDP)** to determine whether a request should be permitted or denied.
 
-The policy supports both **HTTP Proxy APIs** and **MCP Proxy APIs** (via the [Gravitee MCP Proxy Reactor](https://github.com/gravitee-io/gravitee-reactor-mcp-proxy)).
-
-The policy sends an Access Evaluation request to the PDP containing:
-- **Subject** — who is making the request (e.g., user identity)
-- **Resource** — what is being accessed (e.g., API route, document)
-- **Action** — what operation is being performed (e.g., GET, POST, can_read)
-- **Context** — environmental attributes (e.g., time, location)
-
-The PDP responds with a `decision` (true/false), and the policy either allows the request to proceed or rejects it.
+The policy supports both **HTTP Proxy APIs** and **MCP Proxy APIs** (via the [Gravitee MCP Proxy Reactor](https://github.com/gravitee-io/gravitee-reactor-mcp-proxy)). The API type is **automatically detected** at runtime — no manual configuration flag is needed.
 
 ```
 ┌────────────┐     ┌───────────────────┐     ┌────────────┐
@@ -36,43 +28,36 @@ The PDP responds with a `decision` (true/false), and the policy either allows th
 ## Features
 
 - **AuthZEN Authorization API 1.0** compliant Access Evaluation requests
-- **Gravitee Expression Language (EL)** support in all configuration fields for dynamic runtime values
-- **Custom metadata** — configurable subject, resource, action properties extracted via EL from request context
-- **MCP Proxy API support** — parses JSON-RPC body to extract MCP method, tool names, resource URIs, and prompt names as context attributes for use in EL expressions
+- **Gravitee Expression Language (EL)** support in all configuration fields
+- **Custom metadata** — configurable subject, resource, action properties extracted via EL
+- **Automatic API type detection** — detects HTTP Proxy vs MCP Proxy at runtime
+- **MCP Proxy API support** — uses the common MCP parser (`gravitee-common-mcp`) to extract tool names, resource URIs, prompt names, and tool arguments for zero-config AuthZEN auto-mapping
 - **Configurable error handling** — fail-open or fail-closed when the PDP is unreachable
 - **Response context preservation** — AuthZEN response context stored as gateway execution attributes
-- **V4 API support** — reactive implementation using `HttpPolicy` interface with RxJava 3
-- **V3 API backward compatibility** — legacy `@OnRequest` annotation support
+- **Jackson-based JSON processing** — uses Jackson ObjectMapper (consistent with the Gravitee ecosystem)
+- **V4 reactive API** — `HttpPolicy` interface with RxJava 3
 
 ## AuthZEN Request Format
 
-The policy sends a `POST` request to the configured PDP endpoint with this JSON body:
+The policy sends a `POST` request to the configured PDP endpoint:
 
 ```json
 {
   "subject": {
     "type": "user",
     "id": "alice@example.com",
-    "properties": {
-      "department": "Engineering"
-    }
+    "properties": { "department": "Engineering" }
   },
   "resource": {
     "type": "route",
-    "id": "/api/orders",
-    "properties": {
-      "api_id": "my-api-v2"
-    }
+    "id": "/api/orders"
   },
   "action": {
     "name": "POST",
-    "properties": {
-      "method": "POST"
-    }
+    "properties": { "method": "POST" }
   },
   "context": {
-    "time": "2025-01-15T10:30:00Z",
-    "gateway": "gravitee"
+    "time": "2025-01-15T10:30:00Z"
   }
 }
 ```
@@ -82,9 +67,7 @@ The PDP responds with:
 ```json
 {
   "decision": true,
-  "context": {
-    "reason": "User has editor role"
-  }
+  "context": { "reason": "User has editor role" }
 }
 ```
 
@@ -101,42 +84,36 @@ The PDP responds with:
 
 | Property | Description | Required | Default | EL Support |
 |----------|-------------|----------|---------|------------|
-| `subjectType` | Type of the subject (e.g., "user", "identity", "service") | No | `user` | Yes |
+| `subjectType` | Type of the subject (e.g., "user", "identity") | No | `user` | Yes |
 | `subjectId` | Unique identifier of the subject | Yes | — | Yes |
-| `subjectProperties` | Additional key-value properties for the subject | No | `[]` | Values: Yes |
+| `subjectProperties` | Additional key-value properties | No | `[]` | Values: Yes |
 
 ### AuthZEN Resource
 
 | Property | Description | Required | Default | EL Support |
 |----------|-------------|----------|---------|------------|
-| `resourceType` | Type of the resource (e.g., "route", "api", "document") | No | — | Yes |
-| `resourceId` | Unique identifier of the resource | No | — | Yes |
-| `resourceProperties` | Additional key-value properties for the resource | No | `[]` | Values: Yes |
+| `resourceType` | Type of the resource. Auto-mapped on MCP APIs when empty. | No | — | Yes |
+| `resourceId` | Unique identifier of the resource. Auto-mapped on MCP APIs when empty. | No | — | Yes |
+| `resourceProperties` | Additional key-value properties | No | `[]` | Values: Yes |
 
 ### AuthZEN Action
 
 | Property | Description | Required | Default | EL Support |
 |----------|-------------|----------|---------|------------|
-| `actionName` | Name of the action (e.g., "GET", "can_read") | Yes | — | Yes |
-| `actionProperties` | Additional key-value properties for the action | No | `[]` | Values: Yes |
-
-### AuthZEN Context
-
-| Property | Description | Required | Default | EL Support |
-|----------|-------------|----------|---------|------------|
-| `contextEntries` | Key-value pairs for the request context | No | `[]` | Values: Yes |
+| `actionName` | Name of the action. Auto-mapped on MCP APIs when empty. | No | — | Yes |
+| `actionProperties` | Additional key-value properties | No | `[]` | Values: Yes |
 
 ### Error Handling
 
 | Property | Description | Default |
 |----------|-------------|---------|
 | `denyOnError` | Deny requests when PDP is unreachable (fail closed) | `true` |
-| `denyStatusCode` | HTTP status code when access is denied (HTTP APIs) | `403` |
+| `denyStatusCode` | HTTP status code when access is denied (HTTP APIs only) | `403` |
 | `denyMessage` | Response message when access is denied | `Access denied by authorization policy` |
-| `errorStatusCode` | HTTP status code when PDP call fails (HTTP APIs) | `500` |
+| `errorStatusCode` | HTTP status code when PDP call fails (HTTP APIs only) | `500` |
 | `errorMessage` | Response message when PDP call fails | `Authorization service unavailable` |
 
-> **Note:** When `mcpRequestParsing` is enabled, deny and error responses are returned as JSON-RPC error messages (HTTP 200) rather than HTTP error status codes.
+> **Note:** On MCP Proxy APIs, deny and error responses are returned as JSON-RPC error messages (HTTP 200) rather than HTTP error status codes.
 
 ### HTTP Client
 
@@ -148,143 +125,66 @@ The PDP responds with:
 
 ## MCP Proxy API Support
 
-This policy supports running on [Gravitee MCP Proxy APIs](https://github.com/gravitee-io/gravitee-reactor-mcp-proxy), enabling [OpenID AuthZEN-based fine-grained authorization for MCP](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2190).
+This policy supports [Gravitee MCP Proxy APIs](https://github.com/gravitee-io/gravitee-reactor-mcp-proxy), enabling [OpenID AuthZEN-based fine-grained authorization for MCP](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2190).
 
-When `mcpRequestParsing` is enabled, the policy:
+### Automatic API Type Detection
 
-1. **Reads the HTTP request body** as a JSON-RPC 2.0 message (MCP uses JSON-RPC over HTTP)
-2. **Extracts MCP context** — method name, tool name, resource URI, prompt name — and sets them as execution context attributes
-3. **Auto-maps MCP data to AuthZEN fields** — if `actionName`, `resourceType`, or `resourceId` are left empty, they are automatically populated from the MCP request (zero-config)
-4. **Evaluates EL expressions** for any explicitly configured fields (which can also reference MCP attributes via `{#context.attributes['authzen.mcp.tool.name']}`)
-5. **Sends the AuthZEN evaluation request** to the PDP
-6. **On denial**, returns a proper **JSON-RPC error response** (HTTP 200 with error body) as required by the MCP protocol
+The policy detects the API type by checking the internal `api.type` attribute set by the gateway reactor (`ApiType.MCP_PROXY`). No manual toggle is required — the same policy configuration works on both HTTP and MCP Proxy APIs.
+
+### How It Works on MCP APIs
+
+1. **Detects MCP API type** from the gateway execution context
+2. **Parses the JSON-RPC body** using the common MCP parser (`gravitee-common-mcp`)
+3. **Auto-maps MCP data to AuthZEN fields** — if `actionName`, `resourceType`, or `resourceId` are left empty, they are automatically populated from the MCP request
+4. **Sends the AuthZEN evaluation request** to the PDP
+5. **On denial**, returns a **JSON-RPC error response** (HTTP 200 with error body)
 
 ### Zero-Config Auto-Mapping
 
-When MCP request parsing is enabled, the following AuthZEN fields are **automatically derived** from the MCP request if left unconfigured:
-
 | AuthZEN Field | Auto-Mapped From | Example (`tools/call` for "getPetById") |
 |---------------|------------------|----------------------------------------|
-| `actionName` | Tool name (for `tools/call`) or MCP method (for other methods) | `getPetById` |
+| `actionName` | Tool name (for `tools/call`) or MCP method | `getPetById` |
 | `resourceType` | Unified item type | `mcp-tool` |
 | `resourceId` | Item name (tool name, resource URI, or prompt name) | `getPetById` |
+| `action.properties` | Tool arguments (for `tools/call`) | `{"petId": "1"}` |
 
-This follows the [AuthZEN MCP profile convention](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2190) where, for `tools/call`, the AuthZEN **action name is the tool name** (the specific operation being authorized), not the MCP method. For other MCP methods (`resources/read`, `prompts/get`, etc.), the action name defaults to the MCP method name.
+This follows the [AuthZEN MCP profile](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2190) where, for `tools/call`, the AuthZEN **action name is the tool name** and **tool arguments are included as action properties**.
 
-The user only needs to configure `pdpEndpoint` and `subjectId`. If explicit overrides are needed, any configured value (static or EL) takes precedence over the auto-mapped default.
-
-### MCP Authorization Flow
-
-```
-┌───────────┐     ┌────────────────────────┐     ┌────────────┐
-│ MCP Client│────>│  Gravitee MCP Gateway  │────>│ MCP Server │
-│ (Host)    │     │  ┌──────────────────┐  │     │ (Backend)  │
-│           │     │  │ AuthZEN Policy   │  │     │            │
-│           │     │  │ (PEP)           │  │     │            │
-│           │     │  └────────┬─────────┘  │     │            │
-│           │     │           │            │     │            │
-│           │     └───────────┼────────────┘     └────────────┘
-│           │                 │
-│           │           ┌─────▼─────┐
-│           │           │  AuthZEN  │
-│           │           │  PDP      │
-│           │           └───────────┘
-└───────────┘
-```
-
-### MCP Context Attributes
-
-When `mcpRequestParsing` is enabled, the policy sets the following execution context attributes:
-
-| Attribute | Description | Example | MCP Methods |
-|-----------|-------------|---------|-------------|
-| `authzen.mcp.method` | MCP JSON-RPC method name | `tools/call` | All |
-| `authzen.mcp.tool.name` | Tool name | `fintech_approve_expense` | `tools/call` |
-| `authzen.mcp.tool.arguments` | Tool call arguments (JSON string) | `{"expense_id":"exp-123"}` | `tools/call` |
-| `authzen.mcp.resource.uri` | Resource URI | `/data/users` | `resources/read`, `resources/subscribe` |
-| `authzen.mcp.prompt.name` | Prompt name | `summarize` | `prompts/get` |
-| `authzen.mcp.item.type` | Unified AuthZEN resource type | `mcp-tool`, `mcp-resource`, `mcp-prompt` | All |
-| `authzen.mcp.item.name` | Unified item name (tool name, resource URI, or prompt name) | `fintech_approve_expense` | All |
-
-### MCP Configuration Example (Minimal — Zero-Config)
-
-To use this policy on an MCP Proxy API, just enable MCP request parsing and configure the PDP endpoint and subject. The `actionName`, `resourceType`, and `resourceId` are automatically derived from the MCP request:
+### MCP Configuration Example (Minimal)
 
 | Field | Value |
 |-------|-------|
 | PDP Endpoint | `https://pdp.example.com/access/v1/evaluation` |
-| **Enable MCP Request Parsing** | `true` |
 | Subject Type | `user` |
 | Subject ID | `{#context.attributes['jwt.claims.sub']}` |
-| Resource Type | *(leave empty — auto-mapped to `mcp-tool`, `mcp-resource`, or `mcp-prompt`)* |
-| Resource ID | *(leave empty — auto-mapped to tool name, resource URI, or prompt name)* |
-| Action Name | *(leave empty — auto-mapped to tool name for `tools/call`, or MCP method for others)* |
 
-### MCP Configuration Example (Advanced — Custom Overrides)
-
-If you need to customize the AuthZEN mapping, you can explicitly set fields using EL expressions that reference the MCP context attributes:
-
-| Field | Value |
-|-------|-------|
-| PDP Endpoint | `https://pdp.example.com/access/v1/evaluation` |
-| **Enable MCP Request Parsing** | `true` |
-| Subject Type | `identity` |
-| Subject ID | `{#context.attributes['jwt.claims.preferred_username']}` |
-| Resource Type | `mcp` |
-| Resource ID | `{#context.attributes['authzen.mcp.item.name']}` |
-| Action Name | `{#context.attributes['authzen.mcp.tool.name']}` |
+All other fields are auto-mapped from the MCP request.
 
 ### MCP AuthZEN Request Example
 
-Given an MCP `tools/call` request:
-
-```json
-{
-  "jsonrpc": "2.0",
-  "id": "request_12345",
-  "method": "tools/call",
-  "params": {
-    "name": "fintech_approve_expense",
-    "arguments": {
-      "expense_id": "exp-123",
-      "amount": 5000
-    }
-  }
-}
-```
-
-And a JWT with `sub: "embesozzi"`, the policy builds this AuthZEN evaluation request (aligning with the [AuthZEN MCP profile](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2190)):
+Given an MCP `tools/call` request for "fintech_approve_expense" with arguments `{"expense_id": "exp-123", "amount": 5000}`, the policy builds:
 
 ```json
 {
   "subject": {
     "type": "user",
     "id": "embesozzi",
-    "properties": {
-      "roles": "analyst",
-      "tenant": "finance-dept"
-    }
+    "properties": { "roles": "analyst", "tenant": "finance-dept" }
   },
   "resource": {
     "type": "mcp-tool",
-    "id": "mcp:expenses"
+    "id": "fintech_approve_expense"
   },
   "action": {
     "name": "fintech_approve_expense",
-    "properties": {
-      "expense_id": "exp-123",
-      "amount": "5000"
-    }
+    "properties": { "expense_id": "exp-123", "amount": 5000 }
   }
 }
 ```
 
-Note: `resource.id` is set to `"mcp:expenses"` via explicit configuration (the namespace/scope cannot be derived from the MCP request). The `action.name` is auto-mapped to the tool name `"fintech_approve_expense"` as proposed in the AuthZEN MCP profile.
-```
-
 ### MCP Deny Response
 
-When the PDP denies access on an MCP Proxy API, the policy returns a **JSON-RPC error** (HTTP 200):
+When the PDP denies access, the policy returns a JSON-RPC error (HTTP 200):
 
 ```json
 {
@@ -297,57 +197,7 @@ When the PDP denies access on an MCP Proxy API, the policy returns a **JSON-RPC 
 }
 ```
 
-This follows the MCP protocol convention of returning errors as JSON-RPC error responses rather than HTTP error status codes.
-
-### MCP + HTTP Dual Deployment
-
-The same policy can be deployed on both HTTP Proxy APIs and MCP Proxy APIs:
-
-- **HTTP Proxy API**: Set `mcpRequestParsing` to `false` (default). The policy uses standard HTTP request attributes (path, method, headers) via EL.
-- **MCP Proxy API**: Set `mcpRequestParsing` to `true`. The policy parses the JSON-RPC body and exposes MCP attributes via EL.
-
-## Expression Language Examples
-
-All value fields support [Gravitee Expression Language](https://documentation.gravitee.io/apim/gravitee-expression-language) for dynamic resolution:
-
-```
-# Subject ID from JWT claim
-{#context.attributes['user']}
-
-# Subject ID from request header
-{#request.headers['X-User-Id'][0]}
-
-# Resource as the request path
-{#request.pathInfo}
-
-# Action as the HTTP method
-{#request.method}
-
-# API identifier from context
-{#properties['api.id']}
-
-# Bearer token from context
-Bearer {#context.attributes['oauth.access_token']}
-```
-
-### Example: API Gateway Scenario (AuthZEN Interop)
-
-This configuration matches the [AuthZEN API Gateway interop scenario](https://authzen-interop.net/docs/scenarios/api-gateway):
-
-| Field | Value |
-|-------|-------|
-| PDP Endpoint | `https://pdp.example.com/access/v1/evaluation` |
-| Subject Type | `identity` |
-| Subject ID | `{#context.attributes['jwt.claims.sub']}` |
-| Resource Type | `route` |
-| Resource ID | `{#request.pathInfo}` |
-| Action Name | `{#request.method}` |
-
 ## Execution Attributes
-
-After the policy executes, the following gateway execution attributes are set:
-
-### Common Attributes
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
@@ -356,39 +206,11 @@ After the policy executes, the following gateway execution attributes are set:
 | `authzen.error` | `String` | Error message if the PDP call failed |
 | `authzen.decision.reason` | `String` | Set to `"fail-open"` when error occurs in fail-open mode |
 
-### MCP Attributes (when `mcpRequestParsing` is enabled)
-
-| Attribute | Type | Description |
-|-----------|------|-------------|
-| `authzen.mcp.method` | `String` | MCP JSON-RPC method (e.g., `tools/call`, `resources/read`) |
-| `authzen.mcp.tool.name` | `String` | Tool name (for `tools/call`) |
-| `authzen.mcp.tool.arguments` | `String` (JSON) | Tool call arguments (for `tools/call`) |
-| `authzen.mcp.resource.uri` | `String` | Resource URI (for `resources/read`, `resources/subscribe`) |
-| `authzen.mcp.prompt.name` | `String` | Prompt name (for `prompts/get`) |
-| `authzen.mcp.item.type` | `String` | Unified type: `mcp-tool`, `mcp-resource`, or `mcp-prompt` |
-| `authzen.mcp.item.name` | `String` | Unified name (tool name, resource URI, or prompt name; `*` for list operations) |
-
-These attributes can be used by subsequent policies in the chain:
-
-```
-# Access the PDP decision in a downstream policy
-{#context.attributes['authzen.decision']}
-
-# Access the PDP response context
-{#context.attributes['authzen.response.context']}
-
-# Access MCP method in a downstream policy
-{#context.attributes['authzen.mcp.method']}
-
-# Access the MCP item name (tool/resource/prompt)
-{#context.attributes['authzen.mcp.item.name']}
-```
-
 ## Building
 
 ### Prerequisites
 
-- Java 17+
+- Java 21+
 - Maven 3.8+
 
 ### Build
@@ -399,17 +221,9 @@ mvn clean package
 
 This produces a ZIP file in `target/gravitee-policy-authzen-1.0.0-SNAPSHOT.zip`.
 
-### Dependency Versions
+### Dependencies
 
-The `pom.xml` declares Gravitee dependency versions targeting **APIM 4.x**. If you need to target a different APIM version, adjust the version properties in the POM:
-
-```xml
-<properties>
-    <gravitee-gateway-api.version>4.0.0</gravitee-gateway-api.version>
-    <gravitee-policy-api.version>1.11.0</gravitee-policy-api.version>
-    <!-- ... -->
-</properties>
-```
+The `pom.xml` uses the `gravitee-apim-bom` for dependency management, targeting APIM 4.10+. Dependency versions are inherited from the BOM — no manual version pinning needed.
 
 ## Deployment
 
@@ -419,28 +233,28 @@ The `pom.xml` declares Gravitee dependency versions targeting **APIM 4.x**. If y
    cp target/gravitee-policy-authzen-*.zip ${GRAVITEE_HOME}/plugins/
    ```
 3. Restart the Gravitee Gateway
-4. The "AuthZEN Access Evaluation" policy will appear in the **Security** category of the Policy Studio
+4. The "AuthZEN Access Evaluation" policy will appear in the **Security** category
 
 ## Architecture
-
-### V4 API (Recommended)
 
 The `AuthZENPolicy` class implements `HttpPolicy` from the Gravitee v4 reactive API:
 
 - **Reactive execution** — uses RxJava 3 `Completable` for non-blocking I/O
-- **Async EL resolution** — all Expression Language expressions are evaluated asynchronously via `TemplateEngine.eval()`
-- **Vert.x HTTP client** — uses the Vert.x `HttpClient` for non-blocking HTTP calls to the PDP
-- **Lazy client initialization** — HTTP client is created once and reused across requests
-- **MCP body parsing** — when enabled, uses `ctx.request().onBody()` to buffer and parse JSON-RPC requests, extracting MCP context attributes before AuthZEN evaluation
+- **Async EL resolution** — all Expression Language expressions are evaluated asynchronously
+- **Jackson JSON processing** — uses Jackson `ObjectMapper` for JSON serialization/deserialization
+- **Common MCP parser** — uses `gravitee-common-mcp` (`GraviteeCommonMcpUtils`) for JSON-RPC parsing
+- **API type auto-detection** — checks `InternalContextAttributes.ATTR_INTERNAL_API_TYPE` for MCP support
+- **HTTP client from Node FWK** — creates HTTP clients using the Vert.x instance from the gateway's component context, with proxy configuration from the Node Configuration API
 
-### V3 API (Legacy)
+## Testing
 
-The `AuthZENPolicyV3` class provides backward compatibility for v2/v3 APIs:
+- **Unit tests** — test AuthZEN request building, MCP auto-mapping, configuration defaults
+- **Integration tests** — test full policy execution on both HTTP Proxy and MCP Proxy APIs using the Gravitee gateway tests SDK with WireMock
 
-- Uses `@OnRequest` annotation
-- Synchronous EL resolution via `TemplateEngine.getValue()`
-- Callback-based Vert.x HTTP client usage
-- Creates a new HTTP client per request (no client reuse)
+```bash
+mvn test          # Unit tests only
+mvn verify        # Unit + integration tests
+```
 
 ## References
 
@@ -449,9 +263,8 @@ The `AuthZENPolicyV3` class provides backward compatibility for v2/v3 APIs:
 - [OpenID AuthZEN Integration for MCP Fine-Grained Authorization](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2190)
 - [Gravitee MCP Proxy Reactor](https://github.com/gravitee-io/gravitee-reactor-mcp-proxy)
 - [Gravitee MCP ACL Policy](https://github.com/gravitee-io/gravitee-policy-mcp-acl)
+- [Gravitee Common MCP](https://github.com/gravitee-io/gravitee-common-mcp)
 - [Gravitee APIM Documentation](https://documentation.gravitee.io/apim/)
-- [Gravitee Expression Language](https://documentation.gravitee.io/apim/gravitee-expression-language)
-- [Gravitee API Management Repository](https://github.com/gravitee-io/gravitee-api-management)
 
 ## License
 

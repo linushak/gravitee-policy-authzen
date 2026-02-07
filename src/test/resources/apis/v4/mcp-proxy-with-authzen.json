@@ -1,0 +1,62 @@
+{
+  "id": "api-mcp-authzen",
+  "name": "MCP API with AuthZEN",
+  "gravitee": "4.0.0",
+  "type": "mcp-proxy",
+  "listeners": [
+    {
+      "type": "http",
+      "paths": [
+        {
+          "path": "/test"
+        }
+      ],
+      "entrypoints": [
+        {
+          "type": "mcp-proxy"
+        }
+      ]
+    }
+  ],
+  "endpointGroups": [
+    {
+      "name": "default",
+      "type": "mcp-proxy",
+      "endpoints": [
+        {
+          "name": "default-endpoint",
+          "type": "mcp-proxy",
+          "configuration": {
+            "target": "http://localhost:8080/endpoint"
+          }
+        }
+      ]
+    }
+  ],
+  "flows": [
+    {
+      "name": "AuthZEN MCP Flow",
+      "enabled": true,
+      "path-operator": {
+        "path": "/",
+        "operator": "STARTS_WITH"
+      },
+      "request": [
+        {
+          "name": "AuthZEN",
+          "enabled": true,
+          "policy": "policy-authzen",
+          "configuration": {
+            "pdpEndpoint": "PDP_URL/access/v1/evaluation",
+            "subjectType": "user",
+            "subjectId": "test-user"
+          }
+        }
+      ],
+      "response": []
+    }
+  ],
+  "analytics": {
+    "enabled": false
+  }
+}

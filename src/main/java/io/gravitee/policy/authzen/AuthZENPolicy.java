@@ -15,12 +15,21 @@
  */
 package io.gravitee.policy.authzen;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.graviteesource.common.mcp.model.ParseMcpRequest;
+import com.graviteesource.common.mcp.utils.GraviteeCommonMcpUtils;
 import io.gravitee.el.TemplateEngine;
+import io.gravitee.gateway.reactive.api.ApiType;
 import io.gravitee.gateway.reactive.api.ExecutionFailure;
+import io.gravitee.gateway.reactive.api.context.InternalContextAttributes;
 import io.gravitee.gateway.reactive.api.context.http.HttpPlainExecutionContext;
 import io.gravitee.gateway.reactive.api.policy.http.HttpPolicy;
 import io.gravitee.policy.authzen.configuration.AuthZENPolicyConfiguration;
 import io.gravitee.policy.authzen.configuration.AuthZENProperty;
+import io.modelcontextprotocol.spec.McpSchema;
 import io.reactivex.rxjava3.core.Completable;
 import io.reactivex.rxjava3.core.Maybe;
 import io.reactivex.rxjava3.core.Single;
@@ -31,7 +40,6 @@ import io.vertx.core.http.HttpClient;
 import io.vertx.core.http.HttpClientOptions;
 import io.vertx.core.http.HttpMethod;
 import io.vertx.core.http.RequestOptions;
-import io.vertx.core.json.JsonObject;
 import io.vertx.core.net.ProxyOptions;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
@@ -50,6 +58,9 @@ import lombok.extern.slf4j.Slf4j;
  * Policy Decision Point (PDP) during the HTTP request phase. Based on the PDP's decision
  * ({@code "decision": true/false}), the request is either allowed to proceed or denied.
  *
+ * <p>The policy automatically detects the API type (HTTP proxy vs MCP proxy) and adapts
+ * its behavior accordingly — no manual configuration flag is needed.
+ *
  * <h3>Features:</h3>
  * <ul>
  *   <li>Full AuthZEN Access Evaluation API 1.0 request format support</li>
@@ -57,8 +68,8 @@ import lombok.extern.slf4j.Slf4j;
  *   <li>Custom subject, resource, action properties for rich authorization context</li>
  *   <li>Configurable fail-open/fail-closed error handling</li>
  *   <li>AuthZEN response context preservation as gateway execution attributes</li>
- *   <li>MCP Proxy API support — parses JSON-RPC body and extracts MCP context attributes</li>
- *   <li>V3 API backward compatibility via {@link AuthZENPolicyV3}</li>
+ *   <li>MCP Proxy API support — auto-detects API type and parses JSON-RPC body via
+ *       the common MCP parser from {@code gravitee-common-mcp}</li>
  * </ul>
  *
  * <h3>Execution Attributes Set:</h3>
@@ -69,47 +80,33 @@ import lombok.extern.slf4j.Slf4j;
  *   <li>{@code authzen.decision.reason} - "fail-open" when error + fail-open mode</li>
  * </ul>
  *
- * <h3>MCP Attributes (when mcpRequestParsing is enabled):</h3>
- * <ul>
- *   <li>{@code authzen.mcp.method} - MCP method name (e.g., "tools/call")</li>
- *   <li>{@code authzen.mcp.tool.name} - Tool name (for tools/call)</li>
- *   <li>{@code authzen.mcp.resource.uri} - Resource URI (for resources/read, resources/subscribe)</li>
- *   <li>{@code authzen.mcp.prompt.name} - Prompt name (for prompts/get)</li>
- *   <li>{@code authzen.mcp.item.type} - Unified type: "mcp-tool", "mcp-resource", or "mcp-prompt"</li>
- *   <li>{@code authzen.mcp.item.name} - Unified name (tool name, resource URI, or prompt name)</li>
- * </ul>
+ * @see <a href="https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2190">
+ *      OpenID AuthZEN Integration for Fine-Grained Authorization (MCP)</a>
  */
 @Slf4j
-public class AuthZENPolicy extends AuthZENPolicyV3 implements HttpPolicy {
+public class AuthZENPolicy implements HttpPolicy {
 
   private static final String POLICY_ID = "policy-authzen";
   private static final String AUTHZEN_DENIED_KEY = "AUTHZEN_ACCESS_DENIED";
   private static final String AUTHZEN_ERROR_KEY = "AUTHZEN_ERROR";
 
+  /** Shared Jackson ObjectMapper for JSON serialization/deserialization. */
+  static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+
   /** JSON-RPC error code for authorization denied (server-defined range). */
-  private static final int JSONRPC_ERROR_ACCESS_DENIED = -32001;
+  static final int JSONRPC_ERROR_ACCESS_DENIED = -32001;
 
   /** JSON-RPC error code for authorization service error (server-defined range). */
-  private static final int JSONRPC_ERROR_AUTH_SERVICE = -32002;
+  static final int JSONRPC_ERROR_AUTH_SERVICE = -32002;
 
-  // Well-known MCP JSON-RPC method names
-  private static final String MCP_TOOLS_CALL = "tools/call";
-  private static final String MCP_TOOLS_LIST = "tools/list";
-  private static final String MCP_RESOURCES_READ = "resources/read";
-  private static final String MCP_RESOURCES_LIST = "resources/list";
-  private static final String MCP_RESOURCES_SUBSCRIBE = "resources/subscribe";
-  private static final String MCP_RESOURCES_TEMPLATES_LIST =
-    "resources/templates/list";
-  private static final String MCP_PROMPTS_GET = "prompts/get";
-  private static final String MCP_PROMPTS_LIST = "prompts/list";
+  /** Configuration for this policy instance. */
+  final AuthZENPolicyConfiguration configuration;
 
-  /**
-   * Lazily-initialized reusable HTTP client for PDP calls.
-   */
-  private volatile HttpClient httpClient;
+  /** Lazily-initialized reusable HTTP client for PDP calls. */
+  private HttpClient httpClient;
 
   public AuthZENPolicy(AuthZENPolicyConfiguration configuration) {
-    super(configuration);
+    this.configuration = configuration;
   }
 
   @Override
@@ -117,23 +114,19 @@ public class AuthZENPolicy extends AuthZENPolicyV3 implements HttpPolicy {
     return POLICY_ID;
   }
 
+  // ─── Entry Point ────────────────────────────────────────────────────
+
   /**
    * Executes the AuthZEN Access Evaluation during the HTTP request phase.
    *
-   * <p>When {@code mcpRequestParsing} is enabled, the policy first reads the HTTP body,
-   * parses it as a JSON-RPC MCP request, and extracts MCP context attributes (method,
-   * tool name, resource URI, prompt name) before performing the AuthZEN evaluation.
-   * On denial, it returns a proper JSON-RPC error response (HTTP 200 with error body).
-   *
-   * <p>Flow:
-   * <ol>
-   *   <li>Validate configuration (PDP endpoint must be set)</li>
-   *   <li>(MCP mode) Parse JSON-RPC body and set MCP context attributes</li>
-   *   <li>Asynchronously resolve all Gravitee EL expressions in configuration</li>
-   *   <li>Build the AuthZEN Access Evaluation JSON request</li>
-   *   <li>POST to the AuthZEN PDP endpoint</li>
-   *   <li>Parse the response and allow/deny based on the {@code decision} field</li>
-   * </ol>
+   * <p>The policy automatically detects the API type by checking the internal
+   * {@code api.type} attribute set by the gateway reactor:
+   * <ul>
+   *   <li><b>MCP Proxy</b>: Parses the JSON-RPC body using the common MCP parser,
+   *       auto-maps MCP data to AuthZEN fields, and returns JSON-RPC error on denial.</li>
+   *   <li><b>HTTP Proxy</b> (or other): Uses standard EL-based configuration to build
+   *       the AuthZEN request and returns HTTP error status on denial.</li>
+   * </ul>
    */
   @Override
   public Completable onRequest(final HttpPlainExecutionContext ctx) {
@@ -147,7 +140,11 @@ public class AuthZENPolicy extends AuthZENPolicyV3 implements HttpPolicy {
         );
       }
 
-      if (configuration.isMcpRequestParsing()) {
+      // Auto-detect API type from the gateway reactor context
+      Object rawApiType = ctx.getInternalAttribute(
+        InternalContextAttributes.ATTR_INTERNAL_API_TYPE
+      );
+      if (isMcpProxy(rawApiType)) {
         return handleMcpAuthZENRequest(ctx);
       }
 
@@ -163,8 +160,8 @@ public class AuthZENPolicy extends AuthZENPolicyV3 implements HttpPolicy {
   private Completable handleHttpAuthZENRequest(HttpPlainExecutionContext ctx) {
     TemplateEngine templateEngine = ctx.getTemplateEngine();
 
-    return buildAuthZENRequestAsync(templateEngine)
-      .flatMapCompletable(payload -> {
+    return buildAuthZENRequestAsync(templateEngine).flatMapCompletable(
+      payload -> {
         String jsonBody = payload[0];
         String authHeader = payload[1];
 
@@ -178,22 +175,27 @@ public class AuthZENPolicy extends AuthZENPolicyV3 implements HttpPolicy {
           .flatMapCompletable(responseJson ->
             processAuthZENResponse(ctx, responseJson)
           )
-          .onErrorResumeNext(err -> handleAuthZENError(ctx, err));
-      });
+          .onErrorResumeNext(err -> {
+            // Do not intercept interruption signals (deny/error already issued by interruptWith)
+            if (isInterruptionException(err)) {
+              return Completable.error(err);
+            }
+            return handleAuthZENError(ctx, err);
+          });
+      }
+    );
   }
 
   // ─── MCP Proxy API Flow ─────────────────────────────────────────────
 
   /**
-   * MCP proxy API flow: reads the HTTP body as a JSON-RPC request, extracts MCP
-   * context attributes, then performs the AuthZEN evaluation. On denial, returns
-   * a JSON-RPC error response (HTTP 200 with error body) as required by the MCP protocol.
+   * MCP proxy API flow: reads the HTTP body as a JSON-RPC request using the common
+   * MCP parser, extracts MCP context for AuthZEN auto-mapping, then performs the
+   * AuthZEN evaluation. On denial, returns a JSON-RPC error response (HTTP 200).
    *
-   * <p>This implements the AuthZEN authorization pattern proposed for MCP in
-   * <a href="https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2190">
-   * OpenID AuthZEN Integration for Fine-Grained Authorization</a>.
+   * @see <a href="https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2190">
+   *      OpenID AuthZEN Integration for Fine-Grained Authorization</a>
    */
-  @SuppressWarnings("unchecked")
   private Completable handleMcpAuthZENRequest(HttpPlainExecutionContext ctx) {
     return ctx
       .request()
@@ -201,68 +203,30 @@ public class AuthZENPolicy extends AuthZENPolicyV3 implements HttpPolicy {
         bodyMaybe.flatMap(bodyBuffer -> {
           String bodyString = bodyBuffer.toString(StandardCharsets.UTF_8);
 
-          // Try to parse the body as a JSON-RPC MCP request
-          JsonObject jsonRpc = tryParseJsonRpc(bodyString);
-          Object mcpRequestId = null;
-          String mcpMethod = "";
-          String mcpItemType = "";
-          String mcpItemName = "";
+          // Parse the body using the common MCP parser
+          ParseMcpRequest parseMcpRequest =
+            GraviteeCommonMcpUtils.parseMcpClientRequest(bodyString);
+          McpSchema.JSONRPCRequest mcpRequest = parseMcpRequest.request();
 
-          // Auto-extracted action properties (e.g., tool arguments for tools/call)
-          JsonObject mcpAutoActionProps = null;
-
-          if (jsonRpc != null) {
-            mcpRequestId = jsonRpc.getValue("id");
-            mcpMethod = jsonRpc.getString("method");
-            JsonObject params = jsonRpc.getJsonObject("params");
-
-            // Set MCP context attributes and capture auto-mapping defaults
-            String[] mcpDefaults = setMcpContextAttributes(
-              ctx,
-              mcpMethod,
-              params
+          if (mcpRequest == null) {
+            log.debug(
+              "AuthZEN policy: body is not a valid MCP request, skipping MCP handling"
             );
-            mcpItemType = mcpDefaults[0];
-            mcpItemName = mcpDefaults[1];
-
-            // For tools/call, extract tool arguments as action properties
-            // (per AuthZEN MCP profile: action.properties = tool arguments)
-            if (
-              MCP_TOOLS_CALL.equals(mcpMethod) &&
-              params != null &&
-              params.containsKey("arguments")
-            ) {
-              Object args = params.getValue("arguments");
-              if (args instanceof JsonObject) {
-                mcpAutoActionProps = (JsonObject) args;
-              }
-            }
+            return Maybe.just(bodyBuffer);
           }
 
-          final Object requestId = mcpRequestId;
-          final JsonObject autoActionProps = mcpAutoActionProps;
-          TemplateEngine templateEngine = ctx.getTemplateEngine();
+          // Extract MCP context for AuthZEN auto-mapping
+          String mcpMethod = mcpRequest.method();
+          McpAutoMapping mapping = extractMcpAutoMapping(mcpRequest);
 
-          // Build and execute the AuthZEN evaluation.
-          // MCP-derived values are passed as defaults for empty config fields,
-          // enabling zero-config auto-mapping of MCP data to AuthZEN fields.
-          //
-          // For tools/call, the AuthZEN action name defaults to the TOOL NAME
-          // (e.g., "fintech_approve_expense") as proposed in the AuthZEN MCP
-          // profile (https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2190).
-          // Tool arguments are auto-included as action.properties.
-          // For other MCP methods, the action name defaults to the MCP method
-          // (e.g., "resources/read", "prompts/get").
-          String defaultActionName = MCP_TOOLS_CALL.equals(mcpMethod)
-            ? mcpItemName
-            : mcpMethod;
+          TemplateEngine templateEngine = ctx.getTemplateEngine();
 
           return buildAuthZENRequestAsync(
             templateEngine,
-            defaultActionName,
-            mcpItemType,
-            mcpItemName,
-            autoActionProps
+            mapping.actionName(),
+            mapping.resourceType(),
+            mapping.resourceId(),
+            mapping.actionProperties()
           )
             .flatMapMaybe(payload -> {
               String jsonBody = payload[0];
@@ -274,44 +238,49 @@ public class AuthZENPolicy extends AuthZENPolicyV3 implements HttpPolicy {
                 jsonBody
               );
 
-              return executeAuthZENCall(ctx, jsonBody, authHeader)
-                .flatMapMaybe(responseJson -> {
-                  boolean decision = responseJson.getBoolean("decision", false);
+              return executeAuthZENCall(ctx, jsonBody, authHeader).flatMapMaybe(
+                responseJson -> {
+                  boolean decision = responseJson
+                    .path("decision")
+                    .asBoolean(false);
                   log.debug("AuthZEN MCP policy: PDP decision = {}", decision);
 
                   ctx.setAttribute("authzen.decision", decision);
 
                   if (
                     configuration.isPreserveResponseContext() &&
-                    responseJson.containsKey("context")
+                    responseJson.has("context")
                   ) {
                     ctx.setAttribute(
                       "authzen.response.context",
-                      responseJson.getJsonObject("context").encode()
+                      responseJson.get("context").toString()
                     );
                   }
 
                   if (decision) {
-                    // Access GRANTED — return the original body unchanged
                     return Maybe.just(bodyBuffer);
                   } else {
-                    // Access DENIED — return a JSON-RPC error response
                     String denyReason = extractDenyReason(responseJson);
+                    McpSchema.JSONRPCResponse errorResponse =
+                      GraviteeCommonMcpUtils.generateRcpResponseError(
+                        mcpRequest,
+                        JSONRPC_ERROR_ACCESS_DENIED,
+                        new Exception(denyReason)
+                      );
                     return ctx.interruptBodyWith(
                       new ExecutionFailure(200)
-                        .message(
-                          buildMcpJsonRpcError(
-                            requestId,
-                            JSONRPC_ERROR_ACCESS_DENIED,
-                            denyReason
-                          )
-                        )
+                        .message(writeJsonRpcResponse(errorResponse))
                         .key(AUTHZEN_DENIED_KEY)
                     );
                   }
-                });
+                }
+              );
             })
             .onErrorResumeNext(err -> {
+              // Do not intercept interruption signals (deny/error already issued by interruptBodyWith)
+              if (isInterruptionException(err)) {
+                return Maybe.error(err);
+              }
               log.error(
                 "AuthZEN MCP policy: PDP call failed: {}",
                 err.getMessage(),
@@ -320,20 +289,18 @@ public class AuthZENPolicy extends AuthZENPolicyV3 implements HttpPolicy {
               ctx.setAttribute("authzen.error", err.getMessage());
 
               if (configuration.isDenyOnError()) {
-                // Fail CLOSED — return a JSON-RPC error
+                McpSchema.JSONRPCResponse errorResponse =
+                  GraviteeCommonMcpUtils.generateRcpResponseError(
+                    mcpRequest,
+                    JSONRPC_ERROR_AUTH_SERVICE,
+                    new Exception(configuration.getErrorMessage())
+                  );
                 return ctx.interruptBodyWith(
                   new ExecutionFailure(200)
-                    .message(
-                      buildMcpJsonRpcError(
-                        requestId,
-                        JSONRPC_ERROR_AUTH_SERVICE,
-                        configuration.getErrorMessage()
-                      )
-                    )
+                    .message(writeJsonRpcResponse(errorResponse))
                     .key(AUTHZEN_ERROR_KEY)
                 );
               } else {
-                // Fail OPEN — allow the request to proceed
                 ctx.setAttribute("authzen.decision", true);
                 ctx.setAttribute("authzen.decision.reason", "fail-open");
                 return Maybe.just(bodyBuffer);
@@ -343,199 +310,120 @@ public class AuthZENPolicy extends AuthZENPolicyV3 implements HttpPolicy {
       );
   }
 
-  // ─── MCP Helper Methods ─────────────────────────────────────────────
+  // ─── MCP Auto-Mapping ───────────────────────────────────────────────
 
   /**
-   * Attempts to parse a string as a JSON-RPC 2.0 request.
-   *
-   * @return the parsed JsonObject if valid JSON-RPC 2.0, or null otherwise
+   * Immutable record holding the auto-mapped AuthZEN defaults derived from an MCP request.
    */
-  // Package-private for testing
-  JsonObject tryParseJsonRpc(String body) {
-    try {
-      JsonObject json = new JsonObject(body);
-      if (
-        "2.0".equals(json.getString("jsonrpc")) && json.containsKey("method")
-      ) {
-        return json;
-      }
-    } catch (Exception e) {
-      log.debug("AuthZEN policy: body is not a valid JSON-RPC request", e);
-    }
-    return null;
-  }
+  record McpAutoMapping(
+    String actionName,
+    String resourceType,
+    String resourceId,
+    Map<String, Object> actionProperties
+  ) {}
 
   /**
-   * Extracts MCP-specific data from the JSON-RPC request and sets execution
-   * context attributes that can be referenced in EL expressions.
+   * Extracts AuthZEN auto-mapping defaults from a parsed MCP JSON-RPC request.
    *
-   * <p>Returns a {@code String[2]} containing the unified item type and name
-   * derived from the MCP request, so the caller can pass them as defaults
-   * to the AuthZEN request builder. This enables zero-config auto-mapping:
-   * when the user leaves {@code actionName}, {@code resourceType}, or
-   * {@code resourceId} empty, the policy automatically fills them from
-   * the MCP request data.
+   * <p>For {@code tools/call}, the action name is set to the tool name (per the
+   * AuthZEN MCP profile in issue #2190), and tool arguments are extracted as
+   * action properties. For other methods, the action name is the MCP method.
    *
-   * <p>Universal attributes set for all methods:
-   * <ul>
-   *   <li>{@code authzen.mcp.method} — the MCP method name</li>
-   *   <li>{@code authzen.mcp.item.type} — unified resource type for AuthZEN</li>
-   *   <li>{@code authzen.mcp.item.name} — unified item name for AuthZEN</li>
-   * </ul>
-   *
-   * <p>Method-specific attributes:
-   * <ul>
-   *   <li>tools/call: {@code authzen.mcp.tool.name}, {@code authzen.mcp.tool.arguments}</li>
-   *   <li>resources/read, resources/subscribe: {@code authzen.mcp.resource.uri}</li>
-   *   <li>prompts/get: {@code authzen.mcp.prompt.name}</li>
-   * </ul>
-   *
-   * @return String[2] where [0] = item type, [1] = item name
+   * @param mcpRequest the parsed MCP JSON-RPC request
+   * @return auto-mapping defaults for the AuthZEN request builder
    */
-  // Package-private for testing
-  String[] setMcpContextAttributes(
-    HttpPlainExecutionContext ctx,
-    String method,
-    JsonObject params
-  ) {
-    String itemType = "";
-    String itemName = "";
+  McpAutoMapping extractMcpAutoMapping(McpSchema.JSONRPCRequest mcpRequest) {
+    String method = mcpRequest.method();
+    String actionName = method;
+    String resourceType = "";
+    String resourceId = "";
+    Map<String, Object> actionProperties = null;
 
     if (method == null) {
-      return new String[] { itemType, itemName };
-    }
-
-    ctx.setAttribute("authzen.mcp.method", method);
-
-    if (params == null) {
-      String[] listDefaults = setMcpItemTypeForListMethod(ctx, method);
-      return listDefaults;
+      return new McpAutoMapping(
+        actionName,
+        resourceType,
+        resourceId,
+        actionProperties
+      );
     }
 
     switch (method) {
-      case MCP_TOOLS_CALL:
-        if (params.containsKey("name")) {
-          String toolName = params.getString("name");
-          ctx.setAttribute("authzen.mcp.tool.name", toolName);
-          ctx.setAttribute("authzen.mcp.item.name", toolName);
-          ctx.setAttribute("authzen.mcp.item.type", "mcp-tool");
-          itemType = "mcp-tool";
-          itemName = toolName;
-        }
-        if (params.containsKey("arguments")) {
-          ctx.setAttribute(
-            "authzen.mcp.tool.arguments",
-            params.getValue("arguments").toString()
+      case McpSchema.METHOD_TOOLS_CALL -> {
+        McpSchema.CallToolRequest callToolRequest =
+          GraviteeCommonMcpUtils.mcpJsonMapper.convertValue(
+            mcpRequest.params(),
+            McpSchema.CallToolRequest.class
           );
+        if (callToolRequest != null) {
+          String toolName = callToolRequest.name();
+          actionName = toolName != null ? toolName : method;
+          resourceType = "mcp-tool";
+          resourceId = toolName != null ? toolName : "";
+          actionProperties = callToolRequest.arguments();
         }
-        break;
-      case MCP_RESOURCES_READ:
-      case MCP_RESOURCES_SUBSCRIBE:
-        if (params.containsKey("uri")) {
-          String resourceUri = params.getString("uri");
-          ctx.setAttribute("authzen.mcp.resource.uri", resourceUri);
-          ctx.setAttribute("authzen.mcp.item.name", resourceUri);
-          ctx.setAttribute("authzen.mcp.item.type", "mcp-resource");
-          itemType = "mcp-resource";
-          itemName = resourceUri;
+      }
+      case
+        McpSchema.METHOD_RESOURCES_READ,
+        McpSchema.METHOD_RESOURCES_SUBSCRIBE -> {
+        McpSchema.ReadResourceRequest readRequest =
+          GraviteeCommonMcpUtils.mcpJsonMapper.convertValue(
+            mcpRequest.params(),
+            McpSchema.ReadResourceRequest.class
+          );
+        if (readRequest != null && readRequest.uri() != null) {
+          resourceType = "mcp-resource";
+          resourceId = readRequest.uri();
         }
-        break;
-      case MCP_PROMPTS_GET:
-        if (params.containsKey("name")) {
-          String promptName = params.getString("name");
-          ctx.setAttribute("authzen.mcp.prompt.name", promptName);
-          ctx.setAttribute("authzen.mcp.item.name", promptName);
-          ctx.setAttribute("authzen.mcp.item.type", "mcp-prompt");
-          itemType = "mcp-prompt";
-          itemName = promptName;
+      }
+      case McpSchema.METHOD_PROMPT_GET -> {
+        McpSchema.GetPromptRequest promptRequest =
+          GraviteeCommonMcpUtils.mcpJsonMapper.convertValue(
+            mcpRequest.params(),
+            McpSchema.GetPromptRequest.class
+          );
+        if (promptRequest != null && promptRequest.name() != null) {
+          resourceType = "mcp-prompt";
+          resourceId = promptRequest.name();
         }
-        break;
-      default:
-        return setMcpItemTypeForListMethod(ctx, method);
-    }
-
-    return new String[] { itemType, itemName };
-  }
-
-  /**
-   * Sets unified item type and wildcard name for MCP list methods.
-   *
-   * @return String[2] where [0] = item type, [1] = item name ("*" for list operations)
-   */
-  private String[] setMcpItemTypeForListMethod(
-    HttpPlainExecutionContext ctx,
-    String method
-  ) {
-    String itemType = "";
-    String itemName = "";
-
-    switch (method) {
-      case MCP_TOOLS_LIST:
-        ctx.setAttribute("authzen.mcp.item.type", "mcp-tool");
-        ctx.setAttribute("authzen.mcp.item.name", "*");
-        itemType = "mcp-tool";
-        itemName = "*";
-        break;
-      case MCP_RESOURCES_LIST:
-      case MCP_RESOURCES_TEMPLATES_LIST:
-        ctx.setAttribute("authzen.mcp.item.type", "mcp-resource");
-        ctx.setAttribute("authzen.mcp.item.name", "*");
-        itemType = "mcp-resource";
-        itemName = "*";
-        break;
-      case MCP_PROMPTS_LIST:
-        ctx.setAttribute("authzen.mcp.item.type", "mcp-prompt");
-        ctx.setAttribute("authzen.mcp.item.name", "*");
-        itemType = "mcp-prompt";
-        itemName = "*";
-        break;
-      default:
-        break;
-    }
-
-    return new String[] { itemType, itemName };
-  }
-
-  /**
-   * Extracts a user-facing deny reason from the AuthZEN PDP response.
-   * Checks for "reason_user" and "reason" fields in the response context.
-   */
-  private String extractDenyReason(JsonObject responseJson) {
-    String denyReason = configuration.getDenyMessage();
-
-    JsonObject respContext = responseJson.getJsonObject("context");
-    if (respContext != null) {
-      if (respContext.containsKey("reason_user")) {
-        Object reasonUser = respContext.getValue("reason_user");
-        if (reasonUser != null) {
-          denyReason = reasonUser.toString();
-        }
-      } else if (respContext.containsKey("reason")) {
-        Object reason = respContext.getValue("reason");
-        if (reason != null) {
-          denyReason = reason.toString();
-        }
+      }
+      case McpSchema.METHOD_TOOLS_LIST -> {
+        resourceType = "mcp-tool";
+        resourceId = "*";
+      }
+      case
+        McpSchema.METHOD_RESOURCES_LIST,
+        McpSchema.METHOD_RESOURCES_TEMPLATES_LIST -> {
+        resourceType = "mcp-resource";
+        resourceId = "*";
+      }
+      case McpSchema.METHOD_PROMPT_LIST -> {
+        resourceType = "mcp-prompt";
+        resourceId = "*";
+      }
+      default -> {
+        // Unknown MCP method — use method name as action, no resource defaults
       }
     }
 
-    return denyReason;
+    return new McpAutoMapping(
+      actionName,
+      resourceType,
+      resourceId,
+      actionProperties
+    );
   }
 
   /**
-   * Builds a JSON-RPC 2.0 error response string for MCP.
-   *
-   * @param requestId the original JSON-RPC request ID
-   * @param code      the JSON-RPC error code
-   * @param message   the error message
-   * @return the serialized JSON-RPC error response
+   * Serializes a JSON-RPC response using the MCP Jackson mapper.
    */
-  // Package-private for testing
-  String buildMcpJsonRpcError(Object requestId, int code, String message) {
-    JsonObject error = new JsonObject()
-      .put("jsonrpc", "2.0")
-      .put("id", requestId)
-      .put("error", new JsonObject().put("code", code).put("message", message));
-    return error.encode();
+  private String writeJsonRpcResponse(McpSchema.JSONRPCResponse response) {
+    try {
+      return GraviteeCommonMcpUtils.mcpJsonMapper.writeValueAsString(response);
+    } catch (Exception e) {
+      log.error("AuthZEN policy: failed to serialize JSON-RPC response", e);
+      return "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32603,\"message\":\"Internal error\"}}";
+    }
   }
 
   // ─── AuthZEN Request Building (Async with EL) ────────────────────────
@@ -546,7 +434,7 @@ public class AuthZENPolicy extends AuthZENPolicyV3 implements HttpPolicy {
    *
    * @return Single emitting a String[2]: [0] = JSON body, [1] = resolved auth header
    */
-  private Single<String[]> buildAuthZENRequestAsync(TemplateEngine engine) {
+  Single<String[]> buildAuthZENRequestAsync(TemplateEngine engine) {
     return buildAuthZENRequestAsync(engine, "", "", "", null);
   }
 
@@ -555,9 +443,7 @@ public class AuthZENPolicy extends AuthZENPolicyV3 implements HttpPolicy {
    * resolving all EL expressions in the configuration.
    *
    * <p>When MCP defaults are provided, they are used as fallback values for fields
-   * that are not explicitly configured. This enables zero-config MCP support:
-   * the policy automatically maps MCP request data to AuthZEN fields unless
-   * the user explicitly configures an override (static value or EL expression).
+   * that are not explicitly configured. This enables zero-config MCP support.
    *
    * @param engine               the template engine for EL evaluation
    * @param defaultActionName    fallback action name (e.g., tool name "getPetById")
@@ -567,100 +453,113 @@ public class AuthZENPolicy extends AuthZENPolicyV3 implements HttpPolicy {
    *                             merged with user-configured action properties (user wins on conflict)
    * @return Single emitting a String[2]: [0] = JSON body, [1] = resolved auth header
    */
-  private Single<String[]> buildAuthZENRequestAsync(
+  Single<String[]> buildAuthZENRequestAsync(
     TemplateEngine engine,
     String defaultActionName,
     String defaultResourceType,
     String defaultResourceId,
-    JsonObject autoActionProperties
+    Map<String, Object> autoActionProperties
   ) {
-    // Resolve the 6 main scalar fields in parallel.
-    // When a config field is empty, the MCP-derived default is used as fallback.
-    return Single
-      .zip(
-        evalOrDefault(engine, configuration.getSubjectType(), "user"),
-        evalOrDefault(engine, configuration.getSubjectId(), ""),
-        evalOrDefault(
-          engine,
-          configuration.getResourceType(),
-          defaultResourceType
-        ),
-        evalOrDefault(engine, configuration.getResourceId(), defaultResourceId),
-        evalOrDefault(engine, configuration.getActionName(), defaultActionName),
-        evalOrDefault(engine, configuration.getAuthorizationHeaderValue(), ""),
-        (
-            subjectType,
-            subjectId,
-            resourceType,
-            resourceId,
-            actionName,
-            authHeader
-          ) ->
-          new String[] {
-            subjectType,
-            subjectId,
-            resourceType,
-            resourceId,
-            actionName,
-            authHeader,
+    return Single.zip(
+      evalOrDefault(engine, configuration.getSubjectType(), "user"),
+      evalOrDefault(engine, configuration.getSubjectId(), ""),
+      evalOrDefault(
+        engine,
+        configuration.getResourceType(),
+        defaultResourceType
+      ),
+      evalOrDefault(engine, configuration.getResourceId(), defaultResourceId),
+      evalOrDefault(engine, configuration.getActionName(), defaultActionName),
+      evalOrDefault(engine, configuration.getAuthorizationHeaderValue(), ""),
+      (
+        subjectType,
+        subjectId,
+        resourceType,
+        resourceId,
+        actionName,
+        authHeader
+      ) ->
+        new String[] {
+          subjectType,
+          subjectId,
+          resourceType,
+          resourceId,
+          actionName,
+          authHeader,
+        }
+    ).flatMap(baseValues ->
+      Single.zip(
+        resolvePropertiesAsync(engine, configuration.getSubjectProperties()),
+        resolvePropertiesAsync(engine, configuration.getResourceProperties()),
+        resolvePropertiesAsync(engine, configuration.getActionProperties()),
+        resolvePropertiesAsync(engine, configuration.getContextEntries()),
+        (subjectProps, resourceProps, actionProps, contextEntries) -> {
+          ObjectNode subject = OBJECT_MAPPER.createObjectNode()
+            .put("type", baseValues[0])
+            .put("id", baseValues[1]);
+          if (!subjectProps.isEmpty()) {
+            subject.set("properties", subjectProps);
           }
+
+          ObjectNode resource = OBJECT_MAPPER.createObjectNode()
+            .put("type", baseValues[2])
+            .put("id", baseValues[3]);
+          if (!resourceProps.isEmpty()) {
+            resource.set("properties", resourceProps);
+          }
+
+          ObjectNode action = OBJECT_MAPPER.createObjectNode().put(
+            "name",
+            baseValues[4]
+          );
+
+          // Merge auto-extracted action properties (e.g., tool arguments)
+          // with user-configured action properties (user wins on conflict).
+          ObjectNode mergedActionProps = OBJECT_MAPPER.createObjectNode();
+          if (autoActionProperties != null && !autoActionProperties.isEmpty()) {
+            JsonNode autoNode = OBJECT_MAPPER.valueToTree(autoActionProperties);
+            if (autoNode.isObject()) {
+              autoNode
+                .fields()
+                .forEachRemaining(e ->
+                  mergedActionProps.set(e.getKey(), e.getValue())
+                );
+            }
+          }
+          if (!actionProps.isEmpty()) {
+            actionProps
+              .fields()
+              .forEachRemaining(e ->
+                mergedActionProps.set(e.getKey(), e.getValue())
+              );
+          }
+          if (!mergedActionProps.isEmpty()) {
+            action.set("properties", mergedActionProps);
+          }
+
+          ObjectNode requestBody = OBJECT_MAPPER.createObjectNode();
+          requestBody.set("subject", subject);
+          requestBody.set("resource", resource);
+          requestBody.set("action", action);
+
+          if (!contextEntries.isEmpty()) {
+            requestBody.set("context", contextEntries);
+          }
+
+          try {
+            return new String[] {
+              OBJECT_MAPPER.writeValueAsString(requestBody),
+              baseValues[5],
+            };
+          } catch (JsonProcessingException e) {
+            throw new RuntimeException(
+              "Failed to serialize AuthZEN request",
+              e
+            );
+          }
+        }
       )
-      .flatMap(baseValues ->
-        // Then resolve all property lists in parallel
-        Single.zip(
-          resolvePropertiesAsync(engine, configuration.getSubjectProperties()),
-          resolvePropertiesAsync(engine, configuration.getResourceProperties()),
-          resolvePropertiesAsync(engine, configuration.getActionProperties()),
-          resolvePropertiesAsync(engine, configuration.getContextEntries()),
-          (subjectProps, resourceProps, actionProps, contextEntries) -> {
-            // Assemble the AuthZEN request JSON
-            JsonObject subject = new JsonObject()
-              .put("type", baseValues[0])
-              .put("id", baseValues[1]);
-            if (!subjectProps.isEmpty()) {
-              subject.put("properties", subjectProps);
-            }
-
-            JsonObject resource = new JsonObject()
-              .put("type", baseValues[2])
-              .put("id", baseValues[3]);
-            if (!resourceProps.isEmpty()) {
-              resource.put("properties", resourceProps);
-            }
-
-            JsonObject action = new JsonObject().put("name", baseValues[4]);
-
-            // Merge auto-extracted action properties (e.g., tool arguments)
-            // with user-configured action properties.
-            // Auto-extracted properties form the base; user-configured
-            // properties override on key conflict.
-            JsonObject mergedActionProps = new JsonObject();
-            if (
-              autoActionProperties != null && !autoActionProperties.isEmpty()
-            ) {
-              mergedActionProps.mergeIn(autoActionProperties);
-            }
-            if (!actionProps.isEmpty()) {
-              // User-configured properties take precedence
-              mergedActionProps.mergeIn(actionProps);
-            }
-            if (!mergedActionProps.isEmpty()) {
-              action.put("properties", mergedActionProps);
-            }
-
-            JsonObject requestBody = new JsonObject()
-              .put("subject", subject)
-              .put("resource", resource)
-              .put("action", action);
-
-            if (!contextEntries.isEmpty()) {
-              requestBody.put("context", contextEntries);
-            }
-
-            return new String[] { requestBody.encode(), baseValues[5] };
-          }
-        )
-      );
+    );
   }
 
   /**
@@ -682,57 +581,48 @@ public class AuthZENPolicy extends AuthZENPolicyV3 implements HttpPolicy {
    * Asynchronously resolves a list of {@link AuthZENProperty} entries, evaluating
    * EL expressions in each value.
    */
-  private Single<JsonObject> resolvePropertiesAsync(
+  private Single<ObjectNode> resolvePropertiesAsync(
     TemplateEngine engine,
     List<AuthZENProperty> properties
   ) {
     if (properties == null || properties.isEmpty()) {
-      return Single.just(new JsonObject());
+      return Single.just(OBJECT_MAPPER.createObjectNode());
     }
 
     List<Single<Map.Entry<String, String>>> entries = properties
       .stream()
       .filter(p -> p.getName() != null && !p.getName().isEmpty())
       .map(prop ->
-        evalOrDefault(engine, prop.getValue(), "")
-          .map(resolved ->
-            (Map.Entry<String, String>) new AbstractMap.SimpleEntry<>(
-              prop.getName(),
-              resolved
-            )
+        evalOrDefault(engine, prop.getValue(), "").map(resolved ->
+          (Map.Entry<String, String>) new AbstractMap.SimpleEntry<>(
+            prop.getName(),
+            resolved
           )
+        )
       )
       .collect(Collectors.toList());
 
     if (entries.isEmpty()) {
-      return Single.just(new JsonObject());
+      return Single.just(OBJECT_MAPPER.createObjectNode());
     }
 
-    return Single.zip(
-      entries,
-      results -> {
-        JsonObject obj = new JsonObject();
-        for (Object result : results) {
-          @SuppressWarnings("unchecked")
-          Map.Entry<String, String> entry = (Map.Entry<String, String>) result;
-          obj.put(entry.getKey(), entry.getValue());
-        }
-        return obj;
+    return Single.zip(entries, results -> {
+      ObjectNode obj = OBJECT_MAPPER.createObjectNode();
+      for (Object result : results) {
+        @SuppressWarnings("unchecked")
+        Map.Entry<String, String> entry = (Map.Entry<String, String>) result;
+        obj.put(entry.getKey(), entry.getValue());
       }
-    );
+      return obj;
+    });
   }
 
   // ─── AuthZEN HTTP Call ────────────────────────────────────────────────
 
   /**
    * Executes the HTTP POST call to the AuthZEN PDP endpoint.
-   *
-   * @param ctx        the execution context (used to obtain Vertx and Configuration components)
-   * @param jsonBody   the serialized AuthZEN request body
-   * @param authHeader the resolved Authorization header value (may be empty)
-   * @return Single emitting the parsed JSON response from the PDP
    */
-  private Single<JsonObject> executeAuthZENCall(
+  private Single<JsonNode> executeAuthZENCall(
     HttpPlainExecutionContext ctx,
     String jsonBody,
     String authHeader
@@ -777,7 +667,7 @@ public class AuthZENPolicy extends AuthZENPolicyV3 implements HttpPolicy {
           })
           .onSuccess(body -> {
             try {
-              JsonObject responseJson = new JsonObject(body.toString());
+              JsonNode responseJson = OBJECT_MAPPER.readTree(body.toString());
               emitter.onSuccess(responseJson);
             } catch (Exception e) {
               emitter.onError(
@@ -798,37 +688,31 @@ public class AuthZENPolicy extends AuthZENPolicyV3 implements HttpPolicy {
   // ─── Response Processing ─────────────────────────────────────────────
 
   /**
-   * Processes the AuthZEN PDP response for HTTP proxy APIs, allowing or denying the request.
+   * Processes the AuthZEN PDP response for HTTP proxy APIs.
    */
   private Completable processAuthZENResponse(
     HttpPlainExecutionContext ctx,
-    JsonObject responseJson
+    JsonNode responseJson
   ) {
-    boolean decision = responseJson.getBoolean("decision", false);
+    boolean decision = responseJson.path("decision").asBoolean(false);
 
     log.debug("AuthZEN policy: PDP decision = {}", decision);
 
-    // Store decision as execution attribute for downstream use
     ctx.setAttribute("authzen.decision", decision);
 
-    // Store response context if present and configured
     if (
-      configuration.isPreserveResponseContext() &&
-      responseJson.containsKey("context")
+      configuration.isPreserveResponseContext() && responseJson.has("context")
     ) {
       ctx.setAttribute(
         "authzen.response.context",
-        responseJson.getJsonObject("context").encode()
+        responseJson.get("context").toString()
       );
     }
 
     if (decision) {
-      // Access GRANTED - continue the request chain
       return Completable.complete();
     } else {
-      // Access DENIED - interrupt the chain with the configured status/message
       String denyReason = extractDenyReason(responseJson);
-
       return ctx.interruptWith(
         new ExecutionFailure(configuration.getDenyStatusCode())
           .message(denyReason)
@@ -839,6 +723,27 @@ public class AuthZENPolicy extends AuthZENPolicyV3 implements HttpPolicy {
   }
 
   // ─── Error Handling ──────────────────────────────────────────────────
+
+  /**
+   * Checks if the given throwable is a gateway interruption signal (e.g. from interruptWith
+   * or interruptBodyWith). These should be re-thrown rather than treated as PDP call failures.
+   * Uses class-name check to avoid compile-time dependency on gateway-core.
+   */
+  private static boolean isInterruptionException(Throwable err) {
+    for (
+      Class<?> clazz = err.getClass();
+      clazz != null;
+      clazz = clazz.getSuperclass()
+    ) {
+      if (
+        clazz.getName().contains("InterruptionException") ||
+        clazz.getName().contains("InterruptionFailureException")
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
 
   /**
    * Handles errors from the AuthZEN PDP call, applying fail-open/fail-closed behavior.
@@ -852,7 +757,6 @@ public class AuthZENPolicy extends AuthZENPolicyV3 implements HttpPolicy {
     ctx.setAttribute("authzen.error", error.getMessage());
 
     if (configuration.isDenyOnError()) {
-      // Fail CLOSED - deny the request
       return ctx.interruptWith(
         new ExecutionFailure(configuration.getErrorStatusCode())
           .message(configuration.getErrorMessage())
@@ -860,48 +764,87 @@ public class AuthZENPolicy extends AuthZENPolicyV3 implements HttpPolicy {
           .contentType("application/json")
       );
     } else {
-      // Fail OPEN - allow the request to proceed
       ctx.setAttribute("authzen.decision", true);
       ctx.setAttribute("authzen.decision.reason", "fail-open");
       return Completable.complete();
     }
   }
 
+  /**
+   * Extracts a user-facing deny reason from the AuthZEN PDP response.
+   */
+  private String extractDenyReason(JsonNode responseJson) {
+    String denyReason = configuration.getDenyMessage();
+
+    JsonNode respContext = responseJson.path("context");
+    if (!respContext.isMissingNode()) {
+      if (respContext.has("reason_user")) {
+        String reasonUser = respContext.path("reason_user").asText(null);
+        if (reasonUser != null) {
+          denyReason = reasonUser;
+        }
+      } else if (respContext.has("reason")) {
+        String reason = respContext.path("reason").asText(null);
+        if (reason != null) {
+          denyReason = reason;
+        }
+      }
+    }
+
+    return denyReason;
+  }
+
   // ─── HTTP Client Management ──────────────────────────────────────────
 
   /**
    * Returns the lazily-initialized, reusable HTTP client for PDP calls.
-   * Thread-safe via double-checked locking.
+   *
+   * <p>Follows the same pattern as the Gravitee callout-http policy: creates
+   * the client from the Node framework's Vert.x instance and uses the
+   * gateway's Configuration component for proxy settings.
    */
+  /**
+   * Checks whether the given raw API type value corresponds to MCP_PROXY.
+   * Handles both String and ApiType enum values.
+   */
+  private boolean isMcpProxy(Object rawApiType) {
+    if (rawApiType instanceof ApiType apiType) {
+      return ApiType.MCP_PROXY.equals(apiType);
+    }
+    if (rawApiType instanceof String apiTypeStr) {
+      return (
+        ApiType.MCP_PROXY.name().equals(apiTypeStr) ||
+        "MCP_PROXY".equalsIgnoreCase(apiTypeStr)
+      );
+    }
+    return false;
+  }
+
   private HttpClient getOrCreateHttpClient(HttpPlainExecutionContext ctx) {
     if (this.httpClient == null) {
-      synchronized (this) {
-        if (this.httpClient == null) {
-          URI uri = URI.create(configuration.getPdpEndpoint());
-          boolean isSsl = "https".equalsIgnoreCase(uri.getScheme());
+      URI uri = URI.create(configuration.getPdpEndpoint());
+      boolean isSsl = "https".equalsIgnoreCase(uri.getScheme());
 
-          HttpClientOptions options = new HttpClientOptions()
-            .setSsl(isSsl)
-            .setTrustAll(true)
-            .setVerifyHost(false)
-            .setConnectTimeout(configuration.getConnectTimeoutMs());
+      HttpClientOptions options = new HttpClientOptions()
+        .setSsl(isSsl)
+        .setTrustAll(true)
+        .setVerifyHost(false)
+        .setConnectTimeout(configuration.getConnectTimeoutMs());
 
-          if (configuration.isUseSystemProxy()) {
-            configureSystemProxyV4(ctx, options);
-          }
-
-          Vertx vertx = ctx.getComponent(Vertx.class);
-          this.httpClient = vertx.createHttpClient(options);
-        }
+      if (configuration.isUseSystemProxy()) {
+        configureSystemProxy(ctx, options);
       }
+
+      Vertx vertx = ctx.getComponent(Vertx.class);
+      this.httpClient = vertx.createHttpClient(options);
     }
     return this.httpClient;
   }
 
   /**
-   * Configures system proxy settings on the HTTP client options (v4 context).
+   * Configures system proxy settings using the Node framework's Configuration.
    */
-  private void configureSystemProxyV4(
+  private void configureSystemProxy(
     HttpPlainExecutionContext ctx,
     HttpClientOptions options
   ) {

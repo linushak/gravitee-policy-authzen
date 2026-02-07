@@ -90,12 +90,18 @@ public class AuthZENPolicyConfiguration implements PolicyConfiguration {
   /**
    * Type of the AuthZEN resource. Supports EL.
    * Examples: "route", "api", "document"
+   *
+   * <p>When deployed on an MCP Proxy API and this field is empty, it is auto-mapped
+   * to "mcp-tool", "mcp-resource", or "mcp-prompt" based on the MCP method.
    */
   private String resourceType;
 
   /**
    * Unique identifier of the resource. Supports EL.
    * Example: "{#request.pathInfo}" or "{#properties['api.id']}"
+   *
+   * <p>When deployed on an MCP Proxy API and this field is empty, it is auto-mapped
+   * to the tool name, resource URI, or prompt name from the MCP request.
    */
   private String resourceId;
 
@@ -110,6 +116,9 @@ public class AuthZENPolicyConfiguration implements PolicyConfiguration {
   /**
    * Name of the AuthZEN action. Supports EL.
    * Examples: "{#request.method}", "can_read", "GET"
+   *
+   * <p>When deployed on an MCP Proxy API and this field is empty, it is auto-mapped
+   * to the tool name for tools/call, or the MCP method for other operations.
    */
   private String actionName;
 
@@ -128,29 +137,6 @@ public class AuthZENPolicyConfiguration implements PolicyConfiguration {
    */
   @Builder.Default
   private List<AuthZENProperty> contextEntries = new ArrayList<>();
-
-  // ─── MCP Proxy Support ────────────────────────────────────────────────
-
-  /**
-   * If true, the policy will buffer and parse the HTTP request body as a JSON-RPC
-   * (MCP) request, extracting MCP method, tool name, resource URI, and prompt name
-   * into execution context attributes. These attributes can then be referenced in
-   * EL expressions for the AuthZEN subject/resource/action fields.
-   *
-   * <p>Enable this when deploying the policy on an MCP Proxy API.
-   *
-   * <p>Attributes set:
-   * <ul>
-   *   <li>{@code authzen.mcp.method} — e.g., "tools/call", "resources/read"</li>
-   *   <li>{@code authzen.mcp.tool.name} — tool name (for tools/call)</li>
-   *   <li>{@code authzen.mcp.resource.uri} — resource URI (for resources/read, resources/subscribe)</li>
-   *   <li>{@code authzen.mcp.prompt.name} — prompt name (for prompts/get)</li>
-   *   <li>{@code authzen.mcp.item.type} — unified type: "mcp-tool", "mcp-resource", or "mcp-prompt"</li>
-   *   <li>{@code authzen.mcp.item.name} — unified name (tool name, resource URI, or prompt name)</li>
-   * </ul>
-   */
-  @Builder.Default
-  private boolean mcpRequestParsing = false;
 
   // ─── Error Handling ──────────────────────────────────────────────────
 

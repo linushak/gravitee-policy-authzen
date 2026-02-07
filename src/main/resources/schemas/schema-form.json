@@ -11,7 +11,7 @@
       "gioConfig": {
         "banner": {
           "title": "AuthZEN PDP Configuration",
-          "text": "Configure the connection to your AuthZEN-compliant Policy Decision Point (PDP). All value fields support Gravitee Expression Language (EL)."
+          "text": "Configure the connection to your AuthZEN-compliant Policy Decision Point (PDP). All value fields support Gravitee Expression Language (EL). When deployed on an MCP Proxy API, the policy automatically detects the API type and auto-maps MCP request data to AuthZEN fields."
         }
       }
     },
@@ -56,12 +56,12 @@
     },
     "resourceType": {
       "title": "Resource Type",
-      "description": "AuthZEN resource type. Supports EL. When MCP request parsing is enabled and this field is empty, it is auto-mapped to 'mcp-tool', 'mcp-resource', or 'mcp-prompt' based on the MCP method.",
+      "description": "AuthZEN resource type. Supports EL. On MCP Proxy APIs, auto-mapped to 'mcp-tool', 'mcp-resource', or 'mcp-prompt' when empty.",
       "type": "string"
     },
     "resourceId": {
       "title": "Resource ID",
-      "description": "Unique identifier of the resource. Supports EL. When MCP request parsing is enabled and this field is empty, it is auto-mapped to the tool name, resource URI, or prompt name from the MCP request.",
+      "description": "Unique identifier of the resource. Supports EL. On MCP Proxy APIs, auto-mapped to tool name, resource URI, or prompt name when empty.",
       "type": "string"
     },
     "resourceProperties": {
@@ -89,7 +89,7 @@
     },
     "actionName": {
       "title": "Action Name",
-      "description": "AuthZEN action name. Supports EL. When MCP request parsing is enabled and this field is empty, it is auto-mapped to the tool name for tools/call (e.g., 'getPetById'), or the MCP method for other operations (e.g., 'resources/read').",
+      "description": "AuthZEN action name. Supports EL. On MCP Proxy APIs, auto-mapped to the tool name for tools/call, or the MCP method for other operations when empty.",
       "type": "string"
     },
     "actionProperties": {
@@ -138,18 +138,6 @@
         "required": ["name", "value"]
       }
     },
-    "mcpRequestParsing": {
-      "title": "Enable MCP Request Parsing",
-      "description": "When enabled, the policy parses the HTTP request body as a JSON-RPC (MCP) request and extracts MCP method, tool name, resource URI, and prompt name into execution context attributes. Enable this when deploying on an MCP Proxy API. These attributes can be used in EL expressions: {#context.attributes['authzen.mcp.method']}, {#context.attributes['authzen.mcp.item.name']}, etc.",
-      "type": "boolean",
-      "default": false,
-      "gioConfig": {
-        "banner": {
-          "title": "MCP Proxy Support",
-          "text": "Enable MCP request parsing to use this policy on MCP Proxy APIs. When enabled, the policy extracts MCP context (tool names, resource URIs, prompt names) from the JSON-RPC body and makes them available as execution attributes for use in EL expressions."
-        }
-      }
-    },
     "denyOnError": {
       "title": "Deny on Error (Fail Closed)",
       "description": "If enabled, requests are denied when the PDP is unreachable or returns an error. If disabled, requests are allowed (fail open).",
@@ -158,7 +146,7 @@
     },
     "denyStatusCode": {
       "title": "Deny HTTP Status Code",
-      "description": "HTTP status code returned when the AuthZEN PDP denies access",
+      "description": "HTTP status code returned when the AuthZEN PDP denies access (HTTP Proxy APIs only; MCP uses JSON-RPC errors)",
       "type": "integer",
       "default": 403,
       "minimum": 400,
@@ -172,7 +160,7 @@
     },
     "errorStatusCode": {
       "title": "Error HTTP Status Code",
-      "description": "HTTP status code returned when the PDP call fails",
+      "description": "HTTP status code returned when the PDP call fails (HTTP Proxy APIs only; MCP uses JSON-RPC errors)",
       "type": "integer",
       "default": 500,
       "minimum": 400,

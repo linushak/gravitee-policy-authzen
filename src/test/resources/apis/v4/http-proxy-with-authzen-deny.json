@@ -1,0 +1,65 @@
+{
+  "id": "api-http-authzen-deny",
+  "name": "HTTP API with AuthZEN (deny config)",
+  "gravitee": "4.0.0",
+  "type": "proxy",
+  "listeners": [
+    {
+      "type": "http",
+      "paths": [
+        {
+          "path": "/test-deny"
+        }
+      ],
+      "entrypoints": [
+        {
+          "type": "http-proxy"
+        }
+      ]
+    }
+  ],
+  "endpointGroups": [
+    {
+      "name": "default",
+      "type": "http-proxy",
+      "endpoints": [
+        {
+          "name": "default-endpoint",
+          "type": "http-proxy",
+          "configuration": {
+            "target": "http://localhost:8080/endpoint"
+          }
+        }
+      ]
+    }
+  ],
+  "flows": [
+    {
+      "name": "AuthZEN Flow",
+      "methods": [],
+      "enabled": true,
+      "path-operator": {
+        "path": "/",
+        "operator": "STARTS_WITH"
+      },
+      "request": [
+        {
+          "name": "AuthZEN",
+          "enabled": true,
+          "policy": "policy-authzen",
+          "configuration": {
+            "pdpEndpoint": "PDP_URL/access/v1/evaluation",
+            "subjectType": "user",
+            "subjectId": "test-user",
+            "resourceType": "route",
+            "resourceId": "/test",
+            "actionName": "GET",
+            "denyStatusCode": 403,
+            "denyMessage": "Access denied"
+          }
+        }
+      ],
+      "response": []
+    }
+  ]
+}
